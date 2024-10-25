@@ -142,6 +142,77 @@ class _af_loss:
     if self._args["realign"]:
       aux["atom_positions"] = aln["align"](aux["atom_positions"]) * aux["atom_mask"][...,None]
 
+  def _loss_affibody(self, inputs, outputs, aux):
+    """get losses"""
+    opt = inputs["opt"]
+    pos = opt["pos"]
+    if self._args["repeat"] or self._args["homooligomer"]:
+      C, L = self._args["copies"], self._len
+      pos = (jnp.repeat(pos, C).reshape(-1, C) + jnp.arange(C) * L).T.flatten()
+
+    def sub(x, axis=0):
+      return jax.tree_map(lambda y: jnp.take(y, pos, axis), x)
+
+    copies = self._args["copies"] if self._args["homooligomer"] else 1
+    aatype = sub(inputs["aatype"])
+    dgram = {"logits": sub(sub(outputs["distogram"]["logits"]), 1),
+             "bin_edges": outputs["distogram"]["bin_edges"]}
+    atoms = sub(outputs["structure_module"]["final_atom_positions"])
+
+    # affibody
+    lengths = self._pdb["lengths"]
+    tL, bL = sum(lengths[:-1]), lengths[-1]
+    I = {"aatype": aatype, "batch": inputs["batch"], "seq_mask": sub(inputs["seq_mask"])}
+    O = {"distogram": dgram, "structure_module": {"final_atom_positions": atoms}}
+    aln = get_rmsd_loss(I, O, L=tL, include_L=False, copies=copies)
+
+    # affibody
+    # tI = {"aatype": aatype[:tL], "batch": jax.tree_map(lambda y: y[:tL], inputs["batch"]), "seq_mask": sub(inputs["seq_mask"][:tL])}
+    # tO = {"distogram": jax.tree_map(lambda y: y[:tL], dgram), "structure_module": {"final_atom_positions": atoms[:tL]}}
+    # bI = {"aatype": aatype[-tL:], "batch": jax.tree_map(lambda y: y[-tL:], inputs["batch"]), "seq_mask": sub(inputs["seq_mask"][-tL:])}
+    # bO = {"distogram": jax.tree_map(lambda y: y[-tL:], dgram), "structure_module": {"final_atom_positions": atoms[-tL:]}}
+
+    # supervised losses
+    dgram_cce = (get_dgram_loss(I, O, copies=copies, aatype=I["aatype"], target_mode=True, length=tL) +
+                 get_dgram_loss(I, O, copies=copies, aatype=I["aatype"], binder_mode=True, length=bL)) / 2
+    aux["losses"].update({
+      "dgram_cce": dgram_cce,
+      "fape": get_fape_loss(I, O, copies=copies, clamp=opt["fape_cutoff"]),
+      "rmsd": aln["rmsd"],
+    })
+
+    # unsupervised losses
+    self._loss_unsupervised(inputs, outputs, aux)
+
+    # sidechain specific losses
+    if self._args["use_sidechains"] and copies == 1:
+
+      struct = outputs["structure_module"]
+      pred_pos = sub(struct["final_atom14_positions"])
+      true_pos = all_atom.atom37_to_atom14(inputs["batch"]["all_atom_positions"], self._sc["batch"])
+
+      # sc_rmsd
+      aln = _get_sc_rmsd_loss(true_pos, pred_pos, self._sc["pos"])
+      aux["losses"]["sc_rmsd"] = aln["rmsd"]
+
+      # sc_fape
+      if not self._args["use_multimer"]:
+        sc_struct = {**folding.compute_renamed_ground_truth(self._sc["batch"], pred_pos),
+                     "sidechains": {k: sub(struct["sidechains"][k], 1) for k in ["frames", "atom_pos"]}}
+        batch = {**inputs["batch"],
+                 **all_atom.atom37_to_frames(**inputs["batch"])}
+        aux["losses"]["sc_fape"] = folding.sidechain_loss(batch, sc_struct,
+                                                          self._cfg.model.heads.structure_module)["loss"]
+
+      else:
+        # TODO
+        print("ERROR: 'sc_fape' not currently supported for 'multimer' mode")
+        aux["losses"]["sc_fape"] = 0.0
+
+    # align final atoms
+    if self._args["realign"]:
+      aux["atom_positions"] = aln["align"](aux["atom_positions"]) * aux["atom_mask"][..., None]
+
   def _loss_hallucination(self, inputs, outputs, aux):
     # unsupervised losses
     self._loss_unsupervised(inputs, outputs, aux)
@@ -339,17 +410,30 @@ def _get_helix_loss(dgram, dgram_bins, offset=None, mask_2d=None, **kwargs):
 ####################
 # loss functions
 ####################
-def get_dgram_loss(inputs, outputs, copies=1, aatype=None, return_mtx=False):
+def get_dgram_loss(inputs, outputs, copies=1, aatype=None, return_mtx=False, target_mode=False, binder_mode=False, length=None):
 
   batch = inputs["batch"]
   # gather features
   if aatype is None: aatype = batch["aatype"]
-  pred = outputs["distogram"]["logits"]
 
   # get true features
   x, weights = model.modules.pseudo_beta_fn(aatype=aatype,
                                             all_atom_positions=batch["all_atom_positions"],
                                             all_atom_mask=batch["all_atom_mask"])
+
+  if (not target_mode) and (not binder_mode):
+    pred = outputs["distogram"]["logits"]
+    weights = jnp.where(inputs["seq_mask"], weights, 0)
+  else:
+    assert (target_mode & binder_mode != True) and (length is not None)
+    if target_mode:
+      pred = outputs["distogram"]["logits"][:length,:length]
+      weights = jnp.where(inputs["seq_mask"][:length], weights[:length], 0)
+      x = x[:length]
+    elif binder_mode:
+      pred = outputs["distogram"]["logits"][-length:,-length:]
+      weights = jnp.where(inputs["seq_mask"][-length:], weights[-length:], 0)
+      x = x[-length:]
 
   dm = jnp.square(x[:,None]-x[None,:]).sum(-1,keepdims=True)
   bin_edges = jnp.linspace(2.3125, 21.6875, pred.shape[-1] - 1)
@@ -358,8 +442,7 @@ def get_dgram_loss(inputs, outputs, copies=1, aatype=None, return_mtx=False):
   def loss_fn(t,p,m):
     cce = -(t*jax.nn.log_softmax(p)).sum(-1)
     return cce, (cce*m).sum((-1,-2))/(m.sum((-1,-2))+1e-8)
-  
-  weights = jnp.where(inputs["seq_mask"],weights,0)
+
   return _get_pw_loss(true, pred, loss_fn, weights=weights, copies=copies, return_mtx=return_mtx)
 
 def get_fape_loss(inputs, outputs, copies=1, clamp=10.0, return_mtx=False):

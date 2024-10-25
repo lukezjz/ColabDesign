@@ -28,7 +28,7 @@ class mk_af_model(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
                debug=False,
                data_dir=".", 
                **kwargs):  
-    assert protocol in ["fixbb","hallucination","binder","partial"]
+    assert protocol in ["fixbb","hallucination","binder","partial","affibody"]
 
     self.protocol = protocol
     self._num = kwargs.pop("num_seq",1)
@@ -83,6 +83,11 @@ class mk_af_model(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
       self.opt["mlm_dropout"] = 0.15
       self.opt["weights"]["mlm"] = 0.1
 
+    if self.protocol == "affibody":
+        assert "affibody_path" in kwargs and "affibody_pos" in kwargs
+        self.affibody_path= kwargs.pop("affibody_path")
+        self.affibody_pos = kwargs.pop("affibody_pos")
+
     assert len(kwargs) == 0, f"ERROR: the following inputs were not set: {kwargs}"
 
     #############################
@@ -129,9 +134,9 @@ class mk_af_model(design_model, _af_inputs, _af_loss, _af_prep, _af_design, _af_
     #####################################
     # set protocol specific functions
     #####################################
-    idx = ["fixbb","hallucination","binder","partial"].index(self.protocol)
-    self.prep_inputs = [self._prep_fixbb, self._prep_hallucination, self._prep_binder, self._prep_partial][idx]
-    self._get_loss   = [self._loss_fixbb, self._loss_hallucination, self._loss_binder, self._loss_partial][idx]
+    idx = ["fixbb","hallucination","binder","partial","affibody"].index(self.protocol)
+    self.prep_inputs = [self._prep_fixbb, self._prep_hallucination, self._prep_binder, self._prep_partial, self._prep_affibody][idx]
+    self._get_loss   = [self._loss_fixbb, self._loss_hallucination, self._loss_binder, self._loss_partial, self._loss_affibody][idx]
 
   def _get_model(self, cfg, callback=None):
 

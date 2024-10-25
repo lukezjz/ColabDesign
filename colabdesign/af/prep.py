@@ -2,6 +2,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import re
+from Bio.PDB import PDBParser  # affibody
+from Bio import BiopythonWarning
+import warnings
+warnings.simplefilter('ignore', BiopythonWarning)
+
 
 from colabdesign.af.alphafold.data import pipeline, prep_inputs
 from colabdesign.af.alphafold.common import protein, residue_constants
@@ -377,6 +382,101 @@ class _af_prep:
                          "rm_template_seq": rm_template_seq,
                          "rm_template_sc":  rm_template_sc})
   
+    self._prep_model(**kwargs)
+
+  def _prep_affibody(self, pdb_filename, chain=None, use_sidechains = False, ignore_missing = True, atoms_to_exclude = None,
+                     rm_target=False, rm_target_seq=False, rm_target_sc=False,
+                     rm_binder=True, rm_binder_seq=True, rm_binder_sc=True,
+                     rm_template_ic=True, **kwargs):
+    """
+    prep input for affibody
+    ---------------------------------------------------
+    -use_sidechains=True - add a sidechain supervised loss to the specified positions
+      -atoms_to_exclude=["N","C","O"] (for sc_rmsd loss, specify which atoms to exclude)
+    -ignore_missing=True - skip positions that have missing density (no CA coordinate)
+    ---------------------------------------------------
+    """
+
+
+    # rename chain id of affibody
+    pdb_parser = PDBParser(PERMISSIVE=1)
+    chain_ids = [chain.id for chain in pdb_parser.get_structure("", pdb_filename)[0]]
+    available_chain_ids = sorted(set("ABCDEFGHIJKLMNOPQRSTUVWXYZ") - set(chain_ids))
+    self.affibody_chain = available_chain_ids[-1]
+    assert self.affibody_chain == "Z"
+    tmp_pdb_lines = []
+    with open(pdb_filename) as fr:
+      for line in fr:
+        if line.startswith("ATOM"):
+          tmp_pdb_lines.append(line)
+    with open(self.affibody_path) as fr:
+      for line in fr:
+        if line.startswith("ATOM"):
+          tmp_pdb_lines.append(line[:21] + self.affibody_chain + line[22:])
+    with open("tmp.pdb", "w") as fw:
+      fw.writelines(tmp_pdb_lines)
+    pdb_filename = "tmp.pdb"
+    chain = f"{chain},{self.affibody_chain}"
+
+    # prep features
+    self._pdb = prep_pdb(pdb_filename, chain=chain, ignore_missing=ignore_missing,
+                         offsets=kwargs.pop("pdb_offsets", None),
+                         lengths=kwargs.pop("pdb_lengths", None))
+
+    self._pdb["len"] = sum(self._pdb["lengths"])
+
+    self._len = self._pdb["len"]
+    self._lengths = self._pdb["lengths"]
+
+    # feat dims
+    num_seq = self._num
+
+    self.opt["pos"] = self._pdb["pos"] = np.arange(self._pdb["len"])
+    self._pos_info = {"length": np.array([self._pdb["len"]]), "pos": self._pdb["pos"]}
+
+    # configure input features
+    self._inputs = self._prep_features(num_res=sum(self._lengths), num_seq=num_seq)
+    self._inputs["residue_index"] = self._pdb["residue_index"]
+    self._inputs["batch"] = jax.tree_map(lambda x: x[self._pdb["pos"]], self._pdb["batch"])
+    self._inputs.update(get_multi_id(self._lengths))
+
+    # configure options/weights
+    # self.opt["weights"].update({"dgram_cce": 1.0, "rmsd": 0.0, "fape": 0.0, "con": 1.0})
+    self.opt["weights"].update({"dgram_cce": 0.1, "plddt": 0.5, "con": 0.0, "i_con": 0.5, "i_pae": 1.0})
+    self._wt_aatype = self._pdb["batch"]["aatype"][self.opt["pos"]]
+
+    # configure sidechains
+    self._args["use_sidechains"] = use_sidechains
+    if use_sidechains:
+      self._sc = {"batch": prep_inputs.make_atom14_positions(self._inputs["batch"]),
+                  "pos": get_sc_pos(self._wt_aatype, atoms_to_exclude)}
+      self.opt["weights"].update({"sc_rmsd": 0.1, "sc_fape": 0.1})
+      self.opt["fix_pos"] = np.arange(self.opt["pos"].shape[0])
+      self._wt_aatype_sub = self._wt_aatype
+
+    # fixing positions
+    affibody_pos_info = prep_pos(self.affibody_pos, self._pdb["idx"]["residue"][-self._pdb["lengths"][-1]:], self._pdb["idx"]["chain"][-self._pdb["lengths"][-1]:])
+    affibody_pos = affibody_pos_info["pos"] + sum(self._pdb["lengths"][:-1])
+    self.opt["fix_pos"] = np.array([i for i in range(self.opt["pos"].shape[0]) if i not in affibody_pos])
+    self._wt_aatype_sub = self._pdb["batch"]["aatype"][self.opt["fix_pos"]]
+
+    # configure template rm masks
+    (T, L, rm) = (self._lengths[0], sum(self._lengths), {})
+    rm_opt = {
+      "rm_template": {"target": rm_target, "binder": rm_binder},
+      "rm_template_seq": {"target": rm_target_seq, "binder": rm_binder_seq},
+      "rm_template_sc": {"target": rm_target_sc, "binder": rm_binder_sc}
+    }
+    for n, x in rm_opt.items():
+      rm[n] = np.full(L, False)
+      for m, y in x.items():
+        if m == "target": rm[n][:T] = y
+        if m == "binder": rm[n][T:] = y
+
+    # set template [opt]ions
+    self.opt["template"]["rm_ic"] = rm_template_ic
+    self._inputs.update(rm)
+
     self._prep_model(**kwargs)
 
 #######################
