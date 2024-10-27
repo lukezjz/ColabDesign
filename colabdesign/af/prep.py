@@ -1,3 +1,5 @@
+from audioop import avgpp
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -5,6 +7,9 @@ import re
 from Bio.PDB import PDBParser  # affibody
 from Bio import BiopythonWarning
 import warnings
+
+from requests.packages import target
+
 warnings.simplefilter('ignore', BiopythonWarning)
 
 
@@ -384,7 +389,7 @@ class _af_prep:
   
     self._prep_model(**kwargs)
 
-  def _prep_affibody(self, pdb_filename, chain=None, use_sidechains = False, ignore_missing = True, atoms_to_exclude = None,
+  def _prep_affibody(self, pdb_filename, chain=None, use_sidechains=False, ignore_missing=True, atoms_to_exclude=None,
                      rm_target=False, rm_target_seq=False, rm_target_sc=False,
                      rm_binder=True, rm_binder_seq=True, rm_binder_sc=True,
                      rm_template_ic=True, **kwargs):
@@ -399,29 +404,30 @@ class _af_prep:
 
 
     # rename chain id of affibody
-    pdb_parser = PDBParser(PERMISSIVE=1)
-    chain_ids = [chain.id for chain in pdb_parser.get_structure("", pdb_filename)[0]]
+    if chain is None:
+      pdb_parser = PDBParser(PERMISSIVE=1)
+      chain_ids = [chain.id for chain in pdb_parser.get_structure("", pdb_filename)[0]]
+    else:
+      chain_ids = chain.split(",")
     available_chain_ids = sorted(set("ABCDEFGHIJKLMNOPQRSTUVWXYZ") - set(chain_ids))
     self.affibody_chain = available_chain_ids[-1]
     assert self.affibody_chain == "Z"
     tmp_pdb_lines = []
     with open(pdb_filename) as fr:
       for line in fr:
-        if line.startswith("ATOM"):
+        if line.startswith("ATOM") and line[21] in chain_ids:
           tmp_pdb_lines.append(line)
     with open(self.affibody_path) as fr:
       for line in fr:
         if line.startswith("ATOM"):
           tmp_pdb_lines.append(line[:21] + self.affibody_chain + line[22:])
-    with open("tmp.pdb", "w") as fw:
-      fw.writelines(tmp_pdb_lines)
     pdb_filename = "tmp.pdb"
+    with open(pdb_filename, "w") as fw:
+      fw.writelines(tmp_pdb_lines)
     chain = f"{chain},{self.affibody_chain}"
 
     # prep features
-    self._pdb = prep_pdb(pdb_filename, chain=chain, ignore_missing=ignore_missing,
-                         offsets=kwargs.pop("pdb_offsets", None),
-                         lengths=kwargs.pop("pdb_lengths", None))
+    self._pdb = prep_pdb(pdb_filename, chain=chain, ignore_missing=ignore_missing, offsets=None, lengths=None)
 
     self._pdb["len"] = sum(self._pdb["lengths"])
 
@@ -431,6 +437,7 @@ class _af_prep:
     # feat dims
     num_seq = self._num
 
+    # get [pos]itions of interests
     self.opt["pos"] = self._pdb["pos"] = np.arange(self._pdb["len"])
     self._pos_info = {"length": np.array([self._pdb["len"]]), "pos": self._pdb["pos"]}
 
@@ -451,7 +458,6 @@ class _af_prep:
       self._sc = {"batch": prep_inputs.make_atom14_positions(self._inputs["batch"]),
                   "pos": get_sc_pos(self._wt_aatype, atoms_to_exclude)}
       self.opt["weights"].update({"sc_rmsd": 0.1, "sc_fape": 0.1})
-      self.opt["fix_pos"] = np.arange(self.opt["pos"].shape[0])
       self._wt_aatype_sub = self._wt_aatype
 
     # fixing positions
@@ -479,7 +485,54 @@ class _af_prep:
 
     self._prep_model(**kwargs)
 
-#######################
+  def _prep_BRIL(self, pdb_filename, chain=None, frags=None, linker_lengths="3,3",
+                 use_sidechains=False, atoms_to_exclude=None, ignore_missing=True, **kwargs):
+    # TODO: multi-chains
+    if chain is not None:
+      assert len(chain) == 1
+    else:
+      pdb_parser = PDBParser(PERMISSIVE=1)
+      chain_ids = [chain.id for chain in pdb_parser.get_structure("", pdb_filename)[0]]
+      assert len(chain_ids) == 1
+      chain = chain_ids[0]
+    available_chain_ids = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".replace(chain, "")
+    BRIL_chain = available_chain_ids[-1]
+    tmp_pdb_lines = []
+    with open(pdb_filename) as fr:
+      for line in fr:
+        if line.startswith("ATOM") and line[21] == chain:
+          tmp_pdb_lines.append(line)
+    with open(self.BRIL_path) as fr:
+      for line in fr:
+        if line.startswith("ATOM"):
+          tmp_pdb_lines.append(line[:21] + BRIL_chain + line[22:])
+    with open("tmp.pdb", "w") as fw:
+      fw.writelines(tmp_pdb_lines)
+    pdb_filename = "tmp.pdb"
+    with open(pdb_filename, "w") as fw:
+      fw.writelines(tmp_pdb_lines)
+
+    target_frags = [f"{chain}{frag}" for frag in frags.split(",")]
+    BRIL_frags = [f"{BRIL_chain}{frag}" for frag in self.BRIL_frags.split(",")]
+    assert (len(target_frags) == 1 and len(BRIL_frags) == 2) or (len(target_frags) == 2 and len(BRIL_frags) == 1)
+    pos = fix_pos = ",".join(target_frags + BRIL_frags)
+
+    self.loops = linker_lengths.split(",")
+    assert len(self.loops) == 2
+    self.loops = [int(l) for l in self.loops]
+
+    length = sum(prep_pos(pos, **(prep_pdb(pdb_filename, chain=f"{chain},{BRIL_chain}")["idx"]))["length"]) + sum(self.loops)
+    self._prep_partial(pdb_filename, chain=f"{chain},{BRIL_chain}", pos=pos, fix_pos=fix_pos, length=length, rm_template_ic=True,
+                       use_sidechains=use_sidechains, atoms_to_exclude=atoms_to_exclude, ignore_missing=ignore_missing, **kwargs)
+
+
+    if len(target_frags) == 1 and len(BRIL_frags) == 2:
+      self.order = np.array([1, 0, 2])
+    else:
+      self.order = np.array([0, 2, 1])
+    self.rewire(order=self.order, loops=self.loops, offset=0)  # essentially loop length at the N term
+
+  #######################
 # utils
 #######################
 def repeat_idx(idx, copies=1, offset=50):

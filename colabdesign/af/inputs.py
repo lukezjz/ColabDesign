@@ -82,14 +82,14 @@ class _af_inputs:
                                "template_all_atom_mask":      batch["all_atom_mask"]})
 
       # inject template features
-      if self.protocol == "partial":
+      if self.protocol == "partial" or self.protocol == "BRIL":
         pos = opt["pos"]
         if self._args["repeat"] or self._args["homooligomer"]:
           C,L = self._args["copies"], self._len
           pos = (jnp.repeat(pos,C).reshape(-1,C) + jnp.arange(C) * L).T.flatten()
 
       for k,v in template_feats.items():
-        if self.protocol == "partial":
+        if self.protocol == "partial" or self.protocol == "BRIL":
           if k in ["template_dgram"]:
             inputs[k] = inputs[k].at[0,pos[:,None],pos[None,:]].set(v)
           else:
@@ -99,7 +99,7 @@ class _af_inputs:
         
         # remove sidechains (mask anything beyond CB)
         if k in ["template_all_atom_mask"]:
-          if self.protocol == "partial":
+          if self.protocol == "partial" or self.protocol == "BRIL":
             inputs[k] = inputs[k].at[:,pos,5:].set(jnp.where(rm_sc[:,None],0,inputs[k][:,pos,5:]))
             inputs[k] = inputs[k].at[:,pos].set(jnp.where(rm[:,None],0,inputs[k][:,pos]))
           else:
